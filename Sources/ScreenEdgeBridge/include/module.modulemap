@@ -1,0 +1,4 @@
+module ScreenEdgeBridge {
+    header "UCBridge.h"
+    export *
+}

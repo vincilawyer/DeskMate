@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: MIT
+// Adapted from vincilawyer/ScreenEdge, commit 7e418d6352b5a839bd01f4b723f54f3f4d5d9e1c.
+// Copyright (c) 2026 ScreenEdge contributors. See LICENSES/ScreenEdge-MIT.txt.
+import AppKit
+
+final class EdgePanel: NSPanel {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+    // Edge indicators intentionally occupy menu-bar/Dock edges as well.
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+
+@MainActor final class OverlayController {
+    struct Entry { let window: EdgePanel; let portal: Portal; let frame: CGRect }
+    private(set) var entries: [Entry] = []
+    private var timer: Timer?
+    private var displayMode: EdgeDisplayMode = .always
+    private var displays: [DisplayInfo] = []
+    private var screenLocked = false
+    private var alwaysShowWhenLocked = true
+    private var previewWindows: [EdgePanel] = []
+    private var previewTask: DispatchWorkItem?
+    private var lockSpace: LockScreenSpace?
+    var usesLockScreenSpace: Bool { lockSpace != nil }
+
+    func rebuild(model: ScreenEdgeModel) {
+        previewTask?.cancel()
+        previewWindows.forEach { $0.close() }; previewWindows.removeAll()
+        timer?.invalidate(); timer = nil
+        entries.forEach { $0.window.close() }; entries.removeAll()
+        lockSpace = nil
+        guard model.preferences.enabled else { return }
+        guard !model.screenLocked || model.preferences.showWhenLocked else { return }
+        displayMode = model.preferences.displayMode
+        displays = model.displays
+        screenLocked = model.screenLocked
+        alwaysShowWhenLocked = model.preferences.alwaysShowWhenLocked
+        if model.screenLocked && !model.portals.isEmpty {
+            guard let space = LockScreenSpace() else {
+                model.lockScreenMessage = "当前系统暂时无法在锁屏上显示提示线。"
+                return
+            }
+            lockSpace = space
+        }
+        for portal in model.portals {
+            guard let screen = model.displays.first(where: { $0.id == portal.displayID }) else { continue }
+            let rect = portal.rect(on: screen, thickness: model.preferences.thickness).integral
+            guard rect.width > 0 && rect.height > 0 else { continue }
+            let panel = makePanel(frame: rect, appearance: model.preferences.appearance(for: portal), manual: portal.usesWarmPalette, vertical: portal.edge.vertical)
+            if model.screenLocked {
+                panel.canBecomeVisibleWithoutLogin = true
+                guard lockSpace?.attach(panel) == true else {
+                    panel.close()
+                    entries.forEach { $0.window.close() }; entries.removeAll()
+                    lockSpace = nil
+                    model.lockScreenMessage = "当前系统暂时无法在锁屏上显示提示线。"
+                    return
+                }
+                model.lockScreenMessage = nil
+            }
+            panel.alphaValue = 0
+            panel.orderFrontRegardless()
+            entries.append(Entry(window: panel, portal: portal, frame: rect))
+        }
+        updateVisibility()
+        let tracksPointer = displayMode == .pointerScreen ||
+            (displayMode == .nearEdges && !(screenLocked && alwaysShowWhenLocked))
+        if tracksPointer && !entries.isEmpty {
+            // Read position/visibility only. No event taps, permissions, or input interception.
+            timer = Timer(timeInterval: 0.08, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.updateVisibility() }
+            }
+            timer?.tolerance = 0.025
+            RunLoop.main.add(timer!, forMode: .common)
+        }
+    }
+
+    private func makePanel(frame: CGRect, appearance: EdgeAppearance, manual: Bool, vertical: Bool) -> EdgePanel {
+        let panel = EdgePanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.isFloatingPanel = true
+        panel.level = .screenSaver
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.isMovable = false
+        panel.isExcludedFromWindowsMenu = true
+        panel.animationBehavior = .none
+        panel.contentView = EdgeStripView(frame: CGRect(origin: .zero, size: frame.size), appearance: appearance, manual: manual, vertical: vertical)
+        return panel
+    }
+
+    func updateVisibility(pointer: PointerSnapshot? = nil) {
+        let snapshot = pointer ?? (displayMode == .pointerScreen ? PointerStateReader.read() :
+            PointerSnapshot(location: NSEvent.mouseLocation, isVisible: nil))
+        let visible = OverlayVisibility.visibleDisplayIDs(mode: displayMode, displays: displays, pointer: snapshot,
+                                                          screenLocked: screenLocked, alwaysShowWhenLocked: alwaysShowWhenLocked)
+        for entry in entries {
+            let alpha: CGFloat = visible.contains(entry.portal.displayID) ? 1 : 0
+            if entry.window.alphaValue != alpha { entry.window.alphaValue = alpha }
+        }
+    }
+
+    func updateProximity(at mouse: CGPoint) {
+        updateVisibility(pointer: PointerSnapshot(location: mouse, isVisible: true))
+    }
+
+    func preview(model: ScreenEdgeModel) {
+        guard !model.screenLocked else { return }
+        previewTask?.cancel()
+        previewWindows.forEach { $0.close() }; previewWindows.removeAll()
+        for screen in model.displays {
+            let f = screen.frame
+            for remote in [false, true] {
+                let portal = Portal(id: "preview", displayID: screen.id, edge: remote ? .right : .left,
+                                    start: f.minY + f.height * 0.25, end: f.minY + f.height * 0.75,
+                                    label: "预览", manual: false, universalControl: remote)
+                let panel = makePanel(frame: portal.rect(on: screen, thickness: model.preferences.thickness).integral,
+                                      appearance: model.preferences.appearance(for: portal), manual: remote, vertical: true)
+                panel.orderFrontRegardless()
+                previewWindows.append(panel)
+            }
+        }
+        let task = DispatchWorkItem { [weak self] in
+            self?.previewWindows.forEach { $0.close() }; self?.previewWindows.removeAll()
+        }
+        previewTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: task)
+    }
+
+    func stop() {
+        timer?.invalidate(); timer = nil
+        previewTask?.cancel(); previewTask = nil
+        previewWindows.forEach { $0.close() }; previewWindows.removeAll()
+        entries.forEach { $0.window.close() }; entries.removeAll()
+        lockSpace = nil
+    }
+}
